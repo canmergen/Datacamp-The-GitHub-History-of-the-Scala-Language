@@ -1,0 +1,288 @@
+# .py dosyasına dahil edilecek tüm kodlar aşağıda birleştirilmiştir.
+# Bu script, SHAPRFECV, RFECV ve karşılaştırmalı değerlendirmeleri içerir.
+
+def plot_shaprfecv_performance(results_df, title="SHAPRFECV Performance"):
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 6))
+    plt.plot(results_df['n_features'], results_df['mean_roc_auc'], label='Validation AUC', marker='o')
+    plt.fill_between(
+        results_df['n_features'],
+        results_df['mean_roc_auc'] - results_df['std_roc_auc'],
+        results_df['mean_roc_auc'] + results_df['std_roc_auc'],
+        alpha=0.2, label='±1 STD'
+    )
+    plt.xlabel("Number of Features")
+    plt.ylabel("ROC AUC")
+    plt.title(title)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+def find_optimal_feature_subset(results_df, tolerance=0.01, scoring_col='mean_roc_auc'):
+    best_score = results_df[scoring_col].max()
+    threshold = best_score * (1 - tolerance)
+    filtered = results_df[results_df[scoring_col] >= threshold]
+    optimal_row = filtered.sort_values(by='n_features').iloc[0]
+    return optimal_row
+
+def train_and_evaluate_final_model(X, y, model_type, get_model_by_type, selected_features, test_size=0.2, random_state=42):
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_auc_score, average_precision_score, log_loss
+
+    model = get_model_by_type(model_type, random_state=random_state)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X[selected_features], y, test_size=test_size, stratify=y, random_state=random_state
+    )
+    model.fit(X_train, y_train)
+    y_train_proba = model.predict_proba(X_train)[:, 1]
+    y_test_proba = model.predict_proba(X_test)[:, 1]
+
+    return {
+        "Train AUC": roc_auc_score(y_train, y_train_proba),
+        "Train PR-AUC": average_precision_score(y_train, y_train_proba),
+        "Train LogLoss": log_loss(y_train, y_train_proba),
+        "Test AUC": roc_auc_score(y_test, y_test_proba),
+        "Test PR-AUC": average_precision_score(y_test, y_test_proba),
+        "Test LogLoss": log_loss(y_test, y_test_proba),
+        "Used Features": selected_features
+    }
+
+def compare_model_scores_by_features(X, y, model_type, get_model_by_type,
+                                     baseline_features=None, rfecv_features=None, shaprfecv_features=None,
+                                     test_size=0.2, random_state=42):
+    scores = {}
+    if baseline_features is not None:
+        scores["All Features"] = train_and_evaluate_final_model(X, y, model_type, get_model_by_type, baseline_features, test_size, random_state)
+    if rfecv_features is not None:
+        scores["RFECV Features"] = train_and_evaluate_final_model(X, y, model_type, get_model_by_type, rfecv_features, test_size, random_state)
+    if shaprfecv_features is not None:
+        scores["SHAPRFECV Features"] = train_and_evaluate_final_model(X, y, model_type, get_model_by_type, shaprfecv_features, test_size, random_state)
+    return pd.DataFrame(scores).T.reset_index(names="Method")
+
+def run_rfecv_feature_selection(X, y, model_type, get_model_by_type,
+                                 scoring="roc_auc", cv=5, step=1,
+                                 min_features_to_select=5, scale_value=False,
+                                 random_state=42, verbose=True):
+    from sklearn.feature_selection import RFECV
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import StratifiedKFold
+
+    if scale_value:
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+    else:
+        X_scaled = X.copy()
+
+    model = get_model_by_type(model_type, random_state=random_state)
+    if hasattr(model, 'set_params'):
+        try:
+            model.set_params(class_weight='balanced')
+        except:
+            pass
+
+    rfecv = RFECV(
+        estimator=model,
+        step=step,
+        cv=StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state),
+        scoring=scoring,
+        min_features_to_select=min_features_to_select,
+        n_jobs=1
+    )
+    rfecv.fit(X_scaled, y)
+    selected_features = X.columns[rfecv.support_].tolist()
+    if verbose:
+        print(f"\nRFECV selected {len(selected_features)} features out of {X.shape[1]}")
+    return selected_features
+
+def custom_shap_rfecv(
+    X, y,
+    model_type,
+    get_model_by_type,
+    min_features_to_select=5,
+    step=1,
+    scoring='roc_auc',
+    cv=5,
+    scale_value=False,
+    use_class_weight=True,
+    sample_size=None,
+    random_state=42,
+    verbose=True,
+    return_all_outputs=True
+):
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+    import shap
+    import matplotlib.pyplot as plt
+
+    if sample_size is not None and len(X) > sample_size:
+        sampled = X.sample(n=sample_size, random_state=random_state)
+        X = sampled
+        y = y.loc[sampled.index]
+
+    if scale_value:
+        scaler = StandardScaler()
+        X = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+
+    current_features = list(X.columns)
+    removed_features_all = []
+    results = []
+    iteration = 1
+
+    while len(current_features) >= min_features_to_select:
+        if verbose:
+            print(f"\nIteration {iteration}: {len(current_features)} features")
+
+        model = get_model_by_type(model_type, random_state=random_state)
+        if use_class_weight and hasattr(model, 'set_params'):
+            try:
+                model.set_params(class_weight='balanced')
+            except:
+                pass
+
+        model.fit(X[current_features], y)
+        try:
+            if model_type.upper() in ['LGBM', 'XGBOOST', 'RF', 'DT']:
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X[current_features])
+                if isinstance(shap_values, list):
+                    shap_values = shap_values[1]
+            elif model_type.upper() == "LR":
+                explainer = shap.LinearExplainer(model, X[current_features])
+                shap_values = explainer.shap_values(X[current_features])
+            else:
+                explainer = shap.KernelExplainer(model.predict_proba, X[current_features].sample(50, random_state=random_state))
+                shap_values = explainer.shap_values(X[current_features])[1]
+        except Exception as e:
+            print(f"SHAP hesaplaması başarısız oldu: {e}")
+            break
+
+        shap_means = np.abs(shap_values).mean(axis=0)
+        shap_df = pd.DataFrame({'feature': current_features, 'mean_abs_shap': shap_means})
+        shap_df = shap_df.sort_values(by='mean_abs_shap', ascending=True)
+
+        step_count = min(step, len(current_features) - min_features_to_select)
+        to_remove = shap_df.head(step_count)['feature'].tolist()
+
+        scores = cross_val_score(
+            model,
+            X[current_features],
+            y,
+            scoring=scoring,
+            cv=StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state),
+            n_jobs=1
+        )
+
+        results.append({
+            "iteration": iteration,
+            "n_features": len(current_features),
+            f"mean_{scoring}": np.round(np.mean(scores), 5),
+            f"std_{scoring}": np.round(np.std(scores), 5),
+            "selected_features": current_features.copy(),
+            "removed_features": to_remove,
+            "all_removed_features": removed_features_all.copy()
+        })
+
+        removed_features_all += to_remove
+        current_features = [f for f in current_features if f not in to_remove]
+
+        if len(current_features) <= min_features_to_select:
+            break
+        iteration += 1
+
+    results_df = pd.DataFrame(results)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(results_df['n_features'], results_df[f'mean_{scoring}'], label='Validation AUC', marker='o')
+    plt.fill_between(
+        results_df['n_features'],
+        results_df[f'mean_{scoring}'] - results_df[f'std_{scoring}'],
+        results_df[f'mean_{scoring}'] + results_df[f'std_{scoring}'],
+        alpha=0.2, label='±1 STD'
+    )
+    plt.xlabel("Number of Features")
+    plt.ylabel(scoring.upper())
+    plt.title("Manual SHAPRFECV Performance")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    optimal_row = find_optimal_feature_subset(results_df, tolerance=0.01, scoring_col=f"mean_{scoring}")
+    best_features = optimal_row['selected_features']
+    final_test_results = train_and_evaluate_final_model(X, y, model_type, get_model_by_type, best_features, random_state=random_state)
+
+    # results_df içerisine test skorlarını da ekle
+    results_df["shaprfecv_test_auc"] = final_test_results["Test AUC"]
+    results_df["shaprfecv_train_auc"] = final_test_results["Train AUC"]
+
+    return {
+        "results_df": results_df,
+        "best_features": best_features,
+        "optimal_row": optimal_row,
+        "final_test_results": final_test_results
+    }
+
+def full_feature_selection_pipeline(
+    X, y,
+    model_type,
+    get_model_by_type,
+    sample_size=None,
+    scoring="roc_auc",
+    cv=5,
+    step=1,
+    min_features_to_select=5,
+    scale_value=False,
+    use_class_weight=True,
+    random_state=42,
+    verbose=True
+):
+    shap_output = custom_shap_rfecv(
+        X=X,
+        y=y,
+        model_type=model_type,
+        get_model_by_type=get_model_by_type,
+        min_features_to_select=min_features_to_select,
+        step=step,
+        scoring=scoring,
+        cv=cv,
+        scale_value=scale_value,
+        use_class_weight=use_class_weight,
+        sample_size=sample_size,
+        random_state=random_state,
+        verbose=verbose,
+        return_all_outputs=True
+    )
+
+    rfecv_features = run_rfecv_feature_selection(
+        X=X,
+        y=y,
+        model_type=model_type,
+        get_model_by_type=get_model_by_type,
+        scoring=scoring,
+        cv=cv,
+        step=step,
+        min_features_to_select=min_features_to_select,
+        scale_value=scale_value,
+        random_state=random_state,
+        verbose=verbose
+    )
+
+    comparison_df = compare_model_scores_by_features(
+        X, y,
+        model_type=model_type,
+        get_model_by_type=get_model_by_type,
+        baseline_features=X.columns.tolist(),
+        rfecv_features=rfecv_features,
+        shaprfecv_features=shap_output["best_features"],
+        test_size=0.2,
+        random_state=random_state
+    )
+
+    return {
+        "shaprfecv_results": shap_output["results_df"],
+        "shaprfecv_best_features": shap_output["best_features"],
+        "shaprfecv_test_results": shap_output["final_test_results"],
+        "rfecv_selected_features": rfecv_features,
+        "comparison_df": comparison_df
+    }
